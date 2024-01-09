@@ -60,7 +60,7 @@ namespace ASCOM.DarkSkyGeek
         // (ZWO OAG, gearing, etc.) The exact value also depends where you set
         // the zero position... That is why it is made to be configurable!
         internal static string maxPositionProfileName = "Maximum Position";
-        internal static string maxPositionDefault = "4000";
+        internal static string maxPositionDefault = "20000";
 
         // True if using a pinion gear, i.e. the rotation of the focuser is opposite
         // that of the stepper motor arm. False if using a timing belt...
@@ -93,7 +93,7 @@ namespace ASCOM.DarkSkyGeek
         // (I could not come up with an easy way to share them across the two projects)
         private const string SEPARATOR = "\n";
 
-        private const string DEVICE_GUID = "6e18ce4b-0d7b-4850-8470-80df623bf0a4";
+        private const string DEVICE_GUID = "9ee5c8d6-aa7c-43c8-bd70-2e8c540a3ea6";
 
         private const string OK = "OK";
         private const string NOK = "NOK";
@@ -102,7 +102,7 @@ namespace ASCOM.DarkSkyGeek
         private const string FALSE = "FALSE";
 
         private const string COMMAND_PING = "COMMAND:PING";
-        private const string RESULT_PING = "RESULT:PING:" + OK + ":";
+        private const string RESULT_PING = "RESULT:COMMAND:PING:";
 
         private const string COMMAND_FOCUSER_GETPOSITION = "COMMAND:FOCUSER:GETPOSITION";
         private const string RESULT_FOCUSER_POSITION = "RESULT:FOCUSER:POSITION:";
@@ -178,7 +178,7 @@ namespace ASCOM.DarkSkyGeek
             switch (actionName.ToUpper())
             {
                 case "SETZEROPOSITION":
-                    string response = SendCommandToDevice("SetZeroPosition", COMMAND_FOCUSER_SETZEROPOSITION, RESULT_FOCUSER_SETZEROPOSITION);
+                    string response = SendCommandToDevice("SetZeroPosition", COMMAND_FOCUSER_SETZEROPOSITION);
                     if (response != OK)
                     {
                         tl.LogMessage("SetZeroPosition", "Device responded with an error");
@@ -379,7 +379,7 @@ namespace ASCOM.DarkSkyGeek
 
         public void Halt()
         {
-            SendCommandToDevice("Halt", COMMAND_FOCUSER_HALT, RESULT_FOCUSER_HALT);
+            SendCommandToDevice("Halt", COMMAND_FOCUSER_HALT);
             // Ignore whether the firmware responded with OK or NOK.
             // If the firmware responded with NOK, it's likely because
             // the focuser was not moving when the command was sent...
@@ -389,7 +389,7 @@ namespace ASCOM.DarkSkyGeek
         {
             get
             {
-                string response = SendCommandToDevice("IsMoving", COMMAND_FOCUSER_ISMOVING, RESULT_FOCUSER_ISMOVING);
+                string response = SendCommandToDevice("IsMoving", COMMAND_FOCUSER_ISMOVING);
                 if (response != TRUE && response != FALSE)
                 {
                     tl.LogMessage("IsMoving", "Invalid response from device: " + response);
@@ -444,7 +444,7 @@ namespace ASCOM.DarkSkyGeek
             {
                 Position = -Position;
             }
-            string response = SendCommandToDevice("Move", COMMAND_FOCUSER_MOVE + Position.ToString(), RESULT_FOCUSER_MOVE);
+            string response = SendCommandToDevice("Move", COMMAND_FOCUSER_MOVE + Position.ToString());
             if (response != OK)
             {
                 tl.LogMessage("Move", "Device responded with an error");
@@ -456,7 +456,7 @@ namespace ASCOM.DarkSkyGeek
         {
             get
             {
-                string response = SendCommandToDevice("Position", COMMAND_FOCUSER_GETPOSITION, RESULT_FOCUSER_POSITION);
+                string response = SendCommandToDevice("Position", COMMAND_FOCUSER_GETPOSITION);
                 int value;
                 try
                 {
@@ -706,6 +706,7 @@ namespace ASCOM.DarkSkyGeek
                     // PortInUse or Timeout exceptions may happen here!
                     // We ignore them.
                 }
+                LogMessage("ConnectToDevice", "Response from device: " + response);
                 if (response == RESULT_PING + DEVICE_GUID)
                 {
                     // Restore default timeout value...
@@ -726,7 +727,7 @@ namespace ASCOM.DarkSkyGeek
         /// <param name="identifier"></param>
         /// <param name="command"></param>
         /// <param name="resultPrefix"></param>
-        internal string SendCommandToDevice(string identifier, string command, string resultPrefix)
+        internal string SendCommandToDevice(string identifier, string command)
         {
             CheckConnected(identifier);
             tl.LogMessage(identifier, "Sending command " + command + " to device...");
@@ -742,6 +743,7 @@ namespace ASCOM.DarkSkyGeek
                 tl.LogMessage(identifier, "Exception: " + e.Message);
                 throw e;
             }
+            string resultPrefix = "RESULT:" + command + (command.EndsWith(":") ? "" : ":");
             tl.LogMessage(identifier, "Response from device: " + response);
             if (!response.StartsWith(resultPrefix))
             {

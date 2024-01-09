@@ -1,18 +1,4 @@
-/*
- * Arduino_Firmware.ino
- * Copyright (C) 2022 - Present, Julien Lecomte - All Rights Reserved
- * Licensed under the MIT License. See the accompanying LICENSE file for terms.
- */
-
-// Note that I don't use the standard Arduino stepper library because I need
-// to be able to respond to commands while the motor is moving, so I manually
-// move the stepper motor 1 step at a time.
-
-#include <EEPROM.h>
-
-//-- CONSTANTS ----------------------------------------------------------------
-
-constexpr auto DEVICE_GUID = "6e18ce4b-0d7b-4850-8470-80df623bf0a4";
+constexpr auto DEVICE_GUID = "9ee5c8d6-aa7c-43c8-bd70-2e8c540a3ea6";
 
 constexpr auto OK = "OK";
 constexpr auto NOK = "NOK";
@@ -24,277 +10,301 @@ constexpr auto COMMAND_PING = "COMMAND:PING";
 constexpr auto RESULT_PING = "RESULT:PING:OK:";
 
 constexpr auto COMMAND_INFO = "COMMAND:INFO";
-constexpr auto RESULT_INFO = "RESULT:INFO:DarkSkyGeek's OAG Focuser Firmware v1.0";
+constexpr auto RESULT_INFO = "RESULT:DarkSkyGeek's Telescope Focuser Firmware v1.0";
+
+constexpr auto COMMAND_CONFIG_GETMS1 = "COMMAND:CONFIG:GETMS1";
+constexpr auto COMMAND_CONFIG_GETMS2 = "COMMAND:CONFIG:GETMS2";
+constexpr auto COMMAND_CONFIG_GETDISABLE_WHEN_IDLE = "COMMAND:CONFIG:GETDISABLE_WHEN_IDLE";
+constexpr auto COMMAND_CONFIG_GET_STEP_INTERVAL = "COMMAND:CONFIG:GET_STEP_INTERVAL";
+
+constexpr auto COMMAND_CONFIG_SETMS1 = "COMMAND:CONFIG:SETMS1:";
+constexpr auto COMMAND_CONFIG_SETMS2 = "COMMAND:CONFIG:SETMS2:";
+constexpr auto COMMAND_CONFIG_DISABLE_WHEN_IDLE = "COMMAND:CONFIG:DISABLE_WHEN_IDLE:";
+constexpr auto COMMAND_CONFIG_SET_STEP_INTERVAL = "COMMAND:CONFIG:SET_STEP_INTERVAL:";
 
 constexpr auto COMMAND_FOCUSER_GETPOSITION = "COMMAND:FOCUSER:GETPOSITION";
-constexpr auto RESULT_FOCUSER_POSITION = "RESULT:FOCUSER:POSITION:";
-
 constexpr auto COMMAND_FOCUSER_ISMOVING = "COMMAND:FOCUSER:ISMOVING";
-constexpr auto RESULT_FOCUSER_ISMOVING = "RESULT:FOCUSER:ISMOVING:";
-
 constexpr auto COMMAND_FOCUSER_SETZEROPOSITION = "COMMAND:FOCUSER:SETZEROPOSITION";
-constexpr auto RESULT_FOCUSER_SETZEROPOSITION = "RESULT:FOCUSER:SETZEROPOSITION:";
-
 constexpr auto COMMAND_FOCUSER_MOVE = "COMMAND:FOCUSER:MOVE:";
-constexpr auto RESULT_FOCUSER_MOVE = "RESULT:FOCUSER:MOVE:";
-
 constexpr auto COMMAND_FOCUSER_HALT = "COMMAND:FOCUSER:HALT";
-constexpr auto RESULT_FOCUSER_HALT = "RESULT:FOCUSER:HALT:";
 
 constexpr auto ERROR_INVALID_COMMAND = "ERROR:INVALID_COMMAND";
 
-// According to the data sheet, when the 28BYJ-48 motor runs in full step mode,
-// each step corresponds to a rotation of 11.25°. That means there are 32 steps
-// per revolution. Additionally, the motor is outfitted with a gearbox that has
-// a ratio of 64:1, which means that a full revolution requires 2,048 steps.
-const unsigned int STEPS_PER_REVOLUTION = 2048;
+#define STEP_PIN 1
+#define DIR_PIN 0
+#define ENABLED_PIN 4
+#define MS1_PIN 3
+#define MS2_PIN 2
+#define DEFAULT_POSITION 1000
 
-// The ZWO helical focuser moves only over about a 220° range.
-// The gear ratio between small pulley and the focuser body is roughly 1:4.
-// Therefore, we set MAX_STEPS at 5,000 steps.
-const unsigned int MAX_STEPS = 5000;
+volatile long targetPosition = 0;
+volatile long currentPosition = 0;
+unsigned long previousStepTime = 0;
+long stepIntervalMicros = 5000; // Adjust as per the stepper's speed rating.
+bool shouldDisableWhenIdle = false;
 
-// 6RPM = 1 revolution of the motor axle takes 10 seconds.
-// No need to go crazy fast (stepper motors lose torque at higher speeds),
-// and no need to go crazy slow. This value seems like a happy medium...
-const unsigned int RPM_SPEED = 6;
+void setup()
+{
+  // Initialize serial port I/O.
+  Serial.begin(115200);
+  while (!Serial)
+  {
+    ; // Wait for serial port to connect. Required for native USB!
+  }
+  Serial.flush();
 
-// How long do we wait between each step in order to achieve the desired speed?
-const unsigned long STEP_DELAY_MICROSEC = (60L * 1000L * 1000L) / (STEPS_PER_REVOLUTION * RPM_SPEED);
+  pinMode(STEP_PIN, OUTPUT);
+  pinMode(DIR_PIN, OUTPUT);
+  pinMode(ENABLED_PIN, OUTPUT);
+  pinMode(MS1_PIN, OUTPUT);
+  pinMode(MS2_PIN, OUTPUT);
+  digitalWrite(ENABLED_PIN, shouldDisableWhenIdle ? HIGH : LOW);
+  digitalWrite(MS1_PIN, LOW);
+  digitalWrite(MS2_PIN, LOW);
 
-// Pins controlling the motor. Change this depending on your exact wiring!
-const unsigned int MOTOR_PIN_1 = 11; // Blue   - 28BYJ48 pin 1
-const unsigned int MOTOR_PIN_2 =  9; // Yellow - 28BYJ48 pin 3
-const unsigned int MOTOR_PIN_3 = 10; // Pink   - 28BYJ48 pin 2
-const unsigned int MOTOR_PIN_4 =  8; // Orange - 28BYJ48 pin 4
-
-const unsigned int EEPROM_MAGIC_NUMBER = 0x12345678;
-const unsigned int EEPROM_MAGIC_NUMBER_ADDR = 0;
-const unsigned int EEPROM_POSITION_BASE_ADDR = 4;
-
-//-- VARIABLES ----------------------------------------------------------------
-
-// While moving, steps_left > 0
-// When not moving, steps_left == 0
-int steps_left;
-
-enum Direction {
-    forward = 1,
-    backward = -1
-} direction;
-
-// The current position, which we store in EEPROM
-int position;
-
-unsigned long last_step_time;
-
-//-- MICROCONTROLLER FUNCTIONS ------------------------------------------------
-
-// The `setup` function runs once when you press reset or power the board.
-void setup() {
-    // Initialize serial port I/O.
-    Serial.begin(57600);
-    while (!Serial) {
-        ; // Wait for serial port to connect. Required for native USB!
-    }
-    Serial.flush();
-
-    // Initialize motor control pins...
-    pinMode(MOTOR_PIN_1, OUTPUT);
-    pinMode(MOTOR_PIN_2, OUTPUT);
-    pinMode(MOTOR_PIN_3, OUTPUT);
-    pinMode(MOTOR_PIN_4, OUTPUT);
-
-    steps_left = 0;
-    direction = forward;
-    position = 0;
-    last_step_time = 0L;
-
-    int magic_number;
-    EEPROM.get(EEPROM_MAGIC_NUMBER_ADDR, magic_number);
-    if (magic_number == EEPROM_MAGIC_NUMBER) {
-        // The value stored in EEPROM is trustworthy...
-        EEPROM.get(EEPROM_POSITION_BASE_ADDR, position);
-    } else {
-        // The position had never been stored in EEPROM. Initialize it to 0...
-        position = 0;
-        // Store it...
-        EEPROM.put(EEPROM_POSITION_BASE_ADDR, position);
-        // And mark the value as trustworthy...
-        EEPROM.put(EEPROM_MAGIC_NUMBER_ADDR, EEPROM_MAGIC_NUMBER);
-    }
+  // hack until we can get EEPROM working
+  currentPosition = DEFAULT_POSITION;
+  targetPosition = currentPosition;
 }
 
-// The `loop` function runs over and over again until power down or reset.
-void loop() {
-    if (Serial.available() > 0) {
-        String command = Serial.readStringUntil('\n');
-        if (command == COMMAND_PING) {
-            handlePing();
-        }
-        else if (command == COMMAND_INFO) {
-            sendFirmwareInfo();
-        }
-        else if (command == COMMAND_FOCUSER_ISMOVING) {
-            sendFocuserState();
-        }
-        else if (command == COMMAND_FOCUSER_GETPOSITION) {
-            sendFocuserPosition();
-        }
-        else if (command == COMMAND_FOCUSER_SETZEROPOSITION) {
-            setFocuserZeroPosition();
-        }
-        else if (command.startsWith(COMMAND_FOCUSER_MOVE)) {
-            String arg = command.substring(strlen(COMMAND_FOCUSER_MOVE));
-            int value = arg.toInt();
-            moveFocuser(value);
-        }
-        else if (command == COMMAND_FOCUSER_HALT) {
-            haltFocuser();
-        }
-        else {
-            handleInvalidCommand();
-        }
+void loop()
+{
+  if (Serial.available() > 0)
+  {
+    String command = Serial.readStringUntil('\n');
+    if (command == COMMAND_PING)
+    {
+      handlePing();
+    }
+    else if (command == COMMAND_INFO)
+    {
+      sendFirmwareInfo();
+    }
+    else if (command == COMMAND_FOCUSER_ISMOVING)
+    {
+      sendFocuserState();
+    }
+    else if (command == COMMAND_FOCUSER_GETPOSITION)
+    {
+      sendFocuserPosition();
+    }
+    else if (command == COMMAND_FOCUSER_SETZEROPOSITION)
+    {
+      setFocuserZeroPosition();
+    }
+    else if (command.startsWith(COMMAND_FOCUSER_MOVE))
+    {
+      String arg = command.substring(strlen(COMMAND_FOCUSER_MOVE));
+      int value = arg.toInt();
+      serialPrintResult(command);
+      moveFocuser(value);
+    }
+    else if (command == COMMAND_FOCUSER_HALT)
+    {
+      haltFocuser();
+    }
+    // Configuration commands
+    else if (command == COMMAND_CONFIG_GETMS1)
+    {
+      serialPrintResult(COMMAND_CONFIG_GETMS1);
+      Serial.println(digitalRead(MS1_PIN) == HIGH ? TRUE : FALSE);
+    }
+    else if (command == COMMAND_CONFIG_GETMS2)
+    {
+      serialPrintResult(COMMAND_CONFIG_GETMS2);
+      Serial.println(digitalRead(MS2_PIN) == HIGH ? TRUE : FALSE);
+    }
+    else if (command == COMMAND_CONFIG_GETDISABLE_WHEN_IDLE)
+    {
+      serialPrintResult(COMMAND_CONFIG_GETDISABLE_WHEN_IDLE);
+      Serial.println(shouldDisableWhenIdle ? TRUE : FALSE);
+    }
+    else if (command == COMMAND_CONFIG_GET_STEP_INTERVAL)
+    {
+      serialPrintResult(COMMAND_CONFIG_GET_STEP_INTERVAL);
+      Serial.println(stepIntervalMicros);
+    }
+    else if (command.startsWith(COMMAND_CONFIG_SETMS1))
+    {
+      // arg as TRUE or FALSE
+      String arg = command.substring(strlen(COMMAND_CONFIG_SETMS1));
+      digitalWrite(MS1_PIN, arg == TRUE ? HIGH : LOW);
+      serialPrintResult(command);
+      Serial.println(OK);
+    }
+    else if (command.startsWith(COMMAND_CONFIG_SETMS2))
+    {
+      // arg as TRUE or FALSE
+      String arg = command.substring(strlen(COMMAND_CONFIG_SETMS2));
+      digitalWrite(MS2_PIN, arg == TRUE ? HIGH : LOW);
+      serialPrintResult(command);
+      Serial.println(OK);
+    }
+    else if (command.startsWith(COMMAND_CONFIG_DISABLE_WHEN_IDLE))
+    {
+      // arg as TRUE or FALSE
+      String arg = command.substring(strlen(COMMAND_CONFIG_DISABLE_WHEN_IDLE));
+      shouldDisableWhenIdle = arg == TRUE;
+      if (!isMoving())
+      {
+        digitalWrite(ENABLED_PIN, shouldDisableWhenIdle ? HIGH : LOW);
+      }
+      serialPrintResult(command);
+      Serial.println(OK);
+    }
+    else if (command.startsWith(COMMAND_CONFIG_SET_STEP_INTERVAL))
+    {
+      // arg as microseconds
+      String arg = command.substring(strlen(COMMAND_CONFIG_SET_STEP_INTERVAL));
+      stepIntervalMicros = arg.toInt();
+      serialPrintResult(command);
+      Serial.println(OK);
+    }
+    else
+    {
+      handleInvalidCommand();
+    }
+  }
+
+  step();
+}
+
+void step()
+{
+  if (targetPosition == currentPosition)
+  {
+    stop();
+    return;
+  }
+
+  unsigned long currentMicros = micros();
+  if (currentMicros - previousStepTime >= stepIntervalMicros)
+  {
+    if (targetPosition > currentPosition)
+    {
+      digitalWrite(DIR_PIN, LOW);
+      currentPosition++;
+    }
+    else
+    {
+      digitalWrite(DIR_PIN, HIGH);
+      currentPosition--;
     }
 
-    // Make the stepper motor move, if needed, 1 step at a time...
-    step();
+    digitalWrite(STEP_PIN, HIGH);
+    delayMicroseconds(1); // A very short pulse.
+    digitalWrite(STEP_PIN, LOW);
+
+    previousStepTime = currentMicros;
+  }
 }
 
-//-- UTILITY FUNCTIONS -----------------------------------------------------
+void stop()
+{
+  // Make sure we don't take another step.
+  targetPosition = currentPosition;
 
-// See https://forum.arduino.cc/t/modulo-with-negative-int/158317
-int mod(int x, int y){
-    return x < 0 ? ((x+1) % y) + y - 1 : x % y;
+  // Store the final position in EEPROM.
+  // EEPROM.put(EEPROM_POSITION_BASE_ADDR, position);
+
+  // And de-energize the stepper, prevent heat build up, and eliminate vibrations.
+  if (shouldDisableWhenIdle)
+  {
+    digitalWrite(ENABLED_PIN, HIGH);
+  }
 }
 
-void step() {
-    if (steps_left > 0) {
-        // Make sure we don't prematurely take a step if it's too early...
-        unsigned long now = micros();
-        if (now - last_step_time < STEP_DELAY_MICROSEC) {
-            return;
-        }
-
-        last_step_time = now;
-
-        steps_left--;
-
-        if (direction == forward) {
-            position++;
-        } else {
-            position--;
-        }
-
-        switch (mod(position, 4)) {
-            case 0: // 1010
-                digitalWrite(MOTOR_PIN_1, HIGH);
-                digitalWrite(MOTOR_PIN_2, LOW);
-                digitalWrite(MOTOR_PIN_3, HIGH);
-                digitalWrite(MOTOR_PIN_4, LOW);
-                break;
-            case 1: // 0110
-                digitalWrite(MOTOR_PIN_1, LOW);
-                digitalWrite(MOTOR_PIN_2, HIGH);
-                digitalWrite(MOTOR_PIN_3, HIGH);
-                digitalWrite(MOTOR_PIN_4, LOW);
-                break;
-            case 2: // 0101
-                digitalWrite(MOTOR_PIN_1, LOW);
-                digitalWrite(MOTOR_PIN_2, HIGH);
-                digitalWrite(MOTOR_PIN_3, LOW);
-                digitalWrite(MOTOR_PIN_4, HIGH);
-                break;
-            case 3: // 1001
-                digitalWrite(MOTOR_PIN_1, HIGH);
-                digitalWrite(MOTOR_PIN_2, LOW);
-                digitalWrite(MOTOR_PIN_3, LOW);
-                digitalWrite(MOTOR_PIN_4, HIGH);
-                break;
-        }
-
-        if (steps_left == 0) {
-            stop();
-        }
-    }
-}
-
-void stop() {
-    // Make sure we don't take another step.
-    steps_left = 0;
-
-    // Store the final position in EEPROM.
-    EEPROM.put(EEPROM_POSITION_BASE_ADDR, position);
-
-    // And de-energize the stepper by setting all the pins to LOW to save power,
-    // prevent heat build up, and eliminate vibrations.
-    digitalWrite(MOTOR_PIN_1, LOW);
-    digitalWrite(MOTOR_PIN_2, LOW);
-    digitalWrite(MOTOR_PIN_3, LOW);
-    digitalWrite(MOTOR_PIN_4, LOW);
+void serialPrintResult(String command)
+{
+  Serial.print("RESULT:");
+  Serial.print(command);
+  // check if command ends with a colon
+  if (command[command.length() - 1] != ':')
+  {
+    Serial.print(":");
+  }
 }
 
 //-- FOCUSER HANDLING ------------------------------------------------------
 
-void sendFocuserState() {
-    Serial.print(RESULT_FOCUSER_ISMOVING);
-    Serial.println(steps_left != 0 ? TRUE : FALSE);
+bool isMoving()
+{
+  return abs(targetPosition - currentPosition) > 0;
 }
 
-void sendFocuserPosition() {
-    Serial.print(RESULT_FOCUSER_POSITION);
-    Serial.println(position);
+void sendFocuserState()
+{
+  serialPrintResult(COMMAND_FOCUSER_ISMOVING);
+  Serial.println(isMoving() ? TRUE : FALSE);
 }
 
-void setFocuserZeroPosition() {
-    Serial.print(RESULT_FOCUSER_SETZEROPOSITION);
-    if (steps_left == 0) {
-        position = 0;
-        EEPROM.put(EEPROM_POSITION_BASE_ADDR, position);
-        Serial.println(OK);
-    } else {
-        // Cannot set zero position while focuser is still moving...
-        Serial.println(NOK);
-    }
+void sendFocuserPosition()
+{
+  serialPrintResult(COMMAND_FOCUSER_GETPOSITION);
+  Serial.println(currentPosition);
 }
 
-void moveFocuser(int target_position) {
-    Serial.print(RESULT_FOCUSER_MOVE);
-
-    if (steps_left > 0) {
-        // Cannot move while focuser is still moving from previous request...
-        Serial.println(NOK);
-        return;
-    }
-
-    steps_left = abs(target_position - position);
-
-    if (target_position >= position) {
-        direction = forward;
-    } else {
-        direction = backward;
-    }
-
+void setFocuserZeroPosition()
+{
+  serialPrintResult(COMMAND_FOCUSER_SETZEROPOSITION);
+  if (!isMoving())
+  {
+    currentPosition = DEFAULT_POSITION;
+    // EEPROM.put(EEPROM_POSITION_BASE_ADDR, position);
     Serial.println(OK);
+  }
+  else
+  {
+    // Cannot set zero position while focuser is still moving...
+    Serial.println(NOK);
+  }
 }
 
-void haltFocuser() {
-    stop();
-    Serial.print(RESULT_FOCUSER_HALT);
+void moveFocuser(int target_position)
+{
+  if (isMoving())
+  {
+    // Cannot move while focuser is still moving from previous request...
+    Serial.println(NOK);
+    return;
+  }
+
+  if (target_position >= 0)
+  {
+    // Enable the stepper.
+    digitalWrite(ENABLED_PIN, LOW);
+    targetPosition = target_position;
     Serial.println(OK);
+  }
+  else
+  {
+    // Cannot move to a negative position...
+    Serial.println(NOK);
+  }
+}
+
+void haltFocuser()
+{
+  stop();
+  serialPrintResult(COMMAND_FOCUSER_HALT);
+  Serial.println(OK);
 }
 
 //-- MISCELLANEOUS ------------------------------------------------------------
 
-void handlePing() {
-    Serial.print(RESULT_PING);
-    Serial.println(DEVICE_GUID);
+void handlePing()
+{
+  serialPrintResult(COMMAND_PING);
+  Serial.println(DEVICE_GUID);
 }
 
-void sendFirmwareInfo() {
-    Serial.println(RESULT_INFO);
+void sendFirmwareInfo()
+{
+  serialPrintResult(COMMAND_INFO);
+  Serial.println(RESULT_INFO);
 }
 
-void handleInvalidCommand() {
-    Serial.println(ERROR_INVALID_COMMAND);
+void handleInvalidCommand()
+{
+  Serial.println(ERROR_INVALID_COMMAND);
 }
